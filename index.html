@@ -1,0 +1,437 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<title>FLIP WORLD</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body { height:100%; overflow:hidden; background:#000; }
+  body { font-family:-apple-system,"Helvetica Neue",Arial,sans-serif;
+    -webkit-user-select:none; user-select:none; -webkit-tap-highlight-color:transparent; touch-action:none; }
+  #game { display:block; width:100vw; height:100vh; background:#000; }
+  .overlay { position:fixed; inset:0; z-index:10; display:flex; flex-direction:column;
+    align-items:center; justify-content:center; background:#000; color:#fff; text-align:center; padding:32px; gap:22px; }
+  .overlay.hidden { display:none; }
+  .overlay h1 { font-size:clamp(34px,11vw,72px); font-weight:800; letter-spacing:.18em; }
+  .overlay h1 .b { color:#000; background:#fff; padding:0 .12em; }
+  .overlay p { max-width:540px; line-height:1.85; font-size:15px; opacity:.82; }
+  .overlay .keys { font-size:13px; opacity:.55; line-height:2; }
+  .btn { appearance:none; border:2px solid #fff; background:transparent; color:#fff; font-size:18px; font-weight:700;
+    letter-spacing:.12em; padding:16px 40px; border-radius:999px; cursor:pointer; }
+  .btn:active { background:#fff; color:#000; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<div id="startOverlay" class="overlay">
+  <h1>FLIP<span class="b">WORLD</span></h1>
+  <p>
+    左で移動・右でジャンプ。敵は踏んで倒す。トゲに触れるとミス。<br>
+    床は<strong>境界線</strong>。スマホを上下逆さまにすると、足の裏を軸に境界線の<strong>反対側</strong>へ。
+    色が反転し、操作も左右が入れ替わる。<br>
+    <span style="opacity:.6;font-size:13px">※センサーが効かない時は「⟲ 反転」ボタン（PCは F キー）。実機センサーは Safari で。</span>
+  </p>
+  <button id="startBtn" class="btn">タップして開始</button>
+  <div class="keys">PC: ←→/AD 移動 ・ Space ジャンプ ・ F 反転 ・ R リスタート</div>
+</div>
+
+<div id="clearOverlay" class="overlay hidden">
+  <h1 style="letter-spacing:.3em">CLEAR</h1>
+  <p id="clearMsg">ゴール到達。</p>
+  <button id="retryBtn" class="btn">もう一度</button>
+</div>
+
+<script>
+"use strict";
+// =====================================================================
+//  FLIP WORLD — 床は「境界線」。上下で塗りが分かれ、物は領域と反対色で描く
+// =====================================================================
+const canvas=document.getElementById("game"), ctx=canvas.getContext("2d");
+
+const WORLD_H=720, WORLD_W=3400, AXIS=360, LINE_Y=360;     // 境界線 = 中央
+const BAND_TOP=356, BAND_BOT=364;                          // 当たり判定用の薄いバンド（見た目は線）
+const GRAVITY=2200, MOVE_SPEED=330, JUMP_V=820, COYOTE=0.08, JUMP_BUFFER=0.12;
+const PW=36, PH=36;
+const VIEW_WH=820;
+
+const FLIP_DUR=0.34;
+let flipT=FLIP_DUR, flipApplied=true, flipTarget=false;
+
+let flipped=false, gravityDir=1;
+const P={ x:120, y:BAND_TOP-PH, w:PW, h:PH, vx:0, vy:0, grounded:false, support:null, face:1 };
+let SPAWN={ x:120, y:BAND_TOP-PH };
+let orbsGot=0, orbsTotal=0, won=false;
+let shakeT=0, shakeMag=0; const SHAKE_MAXT=0.3;
+let camX=null, camY=null;
+
+// =====================================================================
+//  色：領域の塗りと、物のインク（領域と反対色）
+// =====================================================================
+function opp(c){ return c==="#000" ? "#fff" : "#000"; }
+function aboveColor(){ return "#000"; }   // 境界線の上：常に黒
+function belowColor(){ return "#fff"; }                       // 境界線の下：常に白
+function fillAt(y){ return y < LINE_Y ? aboveColor() : belowColor(); }
+function inkAt(y){ return opp(fillAt(y)); }                    // 物はいる領域と反対色
+// 谷の空洞内は「背景(空気=aboveColor)」が地面側へ食い込んでいる扱い
+function bgAt(x,y){
+  for(const f of features){ if(isWall(f))continue;
+    if(x>f.x && x<f.x+f.w){
+      if(!flipped){ if(y>=BAND_TOP && y<=BAND_TOP+WALL_H) return aboveColor(); }
+      else        { if(y<=BAND_BOT && y>=BAND_BOT-WALL_H) return belowColor(); }
+    }
+  }
+  return fillAt(y);
+}
+function inkXY(x,y){ return opp(bgAt(x,y)); }                  // 谷の中でも見える色
+
+// =====================================================================
+//  レベル（床=境界線。地形は表裏で壁⇄谷に入れ替わる）
+// =====================================================================
+// 二面で対になる地形：片方の世界では壁、もう片方では谷（同じ深さ・底あり）
+const WALL_H=190;          // 壁の高さ＝谷の深さ
+const VWALL=14;            // 谷の側壁の厚み
+const features=[
+  { x:1150, w:96, wallWorld:false },   // 通常=壁 / 反転=谷
+  { x:1380, w:96, wallWorld:true  },   // 反転=壁 / 通常=谷
+  { x:2950, w:96, wallWorld:false },
+  { x:3150, w:96, wallWorld:true  },
+];
+function isWall(f){ return f.wallWorld===flipped; }   // 現在の世界で壁か（=falseなら谷）
+
+// 現在の世界での当たり判定：境界線（谷の所は開口）＋壁の柱／谷のトレンチ
+function buildSolids(){
+  const arr=[], bandH=BAND_BOT-BAND_TOP;
+  const gaps=[];
+  for(const f of features){ if(!isWall(f)) gaps.push([f.x,f.x+f.w]); }   // 谷=境界線に開口
+  gaps.sort((a,b)=>a[0]-b[0]);
+  let cur=0;
+  for(const [a,b] of gaps){ if(a>cur) arr.push({x:cur,y:BAND_TOP,w:a-cur,h:bandH,line:true}); cur=Math.max(cur,b); }
+  if(cur<WORLD_W) arr.push({x:cur,y:BAND_TOP,w:WORLD_W-cur,h:bandH,line:true});
+  for(const f of features){
+    if(isWall(f)){
+      if(!flipped) arr.push({x:f.x,y:BAND_TOP-WALL_H,w:f.w,h:WALL_H+bandH,wall:true});  // 上へ伸びる壁
+      else         arr.push({x:f.x,y:BAND_TOP,        w:f.w,h:WALL_H+bandH,wall:true}); // 下へ伸びる壁
+    } else {
+      // 谷（トレンチ）：底＋両側壁。見た目は別途「穴」として塗る(vpart=描画スキップ)
+      if(!flipped){
+        arr.push({x:f.x,        y:BAND_TOP+WALL_H, w:f.w,  h:bandH, vpart:true});  // 底
+        arr.push({x:f.x,        y:BAND_TOP,        w:VWALL,h:WALL_H, vpart:true}); // 左側壁
+        arr.push({x:f.x+f.w-VWALL,y:BAND_TOP,      w:VWALL,h:WALL_H, vpart:true}); // 右側壁
+      } else {
+        arr.push({x:f.x,        y:BAND_BOT-WALL_H-bandH, w:f.w,  h:bandH, vpart:true});
+        arr.push({x:f.x,        y:BAND_BOT-WALL_H, w:VWALL,h:WALL_H, vpart:true});
+        arr.push({x:f.x+f.w-VWALL,y:BAND_BOT-WALL_H,w:VWALL,h:WALL_H, vpart:true});
+      }
+    }
+  }
+  return arr;
+}
+
+const hazards=[
+  { x:1600, y:330,      w:240, h:26, dir:"up" },   // 上のトゲ → 反転で回避
+  { x:1950, y:BAND_BOT, w:240, h:26, dir:"down" }, // 下のトゲ → 反転で回避
+];
+
+function mkEnemy(min,max){ const w=34,h=34; return { x:min,y:BAND_TOP-h,w,h,min,max,vx:90,alive:true,bob:Math.random()*6.28 }; }
+const enemies=[ mkEnemy(400,660), mkEnemy(2250,2520), mkEnemy(2680,2880) ];
+
+const orbs=[
+  {x:520,y:255,r:16,got:false}, {x:1265,y:470,r:16,got:false},
+  {x:1720,y:470,r:16,got:false}, {x:2400,y:255,r:16,got:false},
+  {x:3050,y:470,r:16,got:false},
+];
+orbsTotal=orbs.length;
+
+const checkpoints=[ {x:1500,used:false}, {x:2200,used:false}, {x:2900,used:false} ];
+const GOAL_X=3320;
+
+const parts=[];
+function burst(x,y,n){ for(let i=0;i<(n||10);i++){ const a=Math.random()*6.283,s=80+Math.random()*220;
+  parts.push({x,y,vx:Math.cos(a)*s,vy:Math.sin(a)*s,life:0.5,max:0.5,type:"sq"});} }
+function ring(x,y){ parts.push({x,y,vx:0,vy:0,life:FLIP_DUR,max:FLIP_DUR,type:"ring",r0:18,r1:240}); }
+
+function hits(a,b){ return a.x<b.x+b.w && a.x+a.w>b.x && a.y<b.y+b.h && a.y+a.h>b.y; }
+function hitsSolid(box){ for (const s of buildSolids()) if (hits(box,s)) return true; return false; }
+
+// =====================================================================
+//  Canvas
+// =====================================================================
+let W=0,H=0,dpr=1;
+function resize(){ dpr=Math.min(window.devicePixelRatio||1,2); W=window.innerWidth; H=window.innerHeight;
+  canvas.width=Math.round(W*dpr); canvas.height=Math.round(H*dpr); canvas.style.width=W+"px"; canvas.style.height=H+"px"; }
+window.addEventListener("resize",resize); window.addEventListener("orientationchange",resize); resize();
+
+function scl(){ return H/VIEW_WH; }
+function sx(x){ return W/2+(x-camX)*scl(); }
+function sy(y){ return H/2+(y-camY)*scl(); }
+function ws(v){ return v*scl(); }
+
+// =====================================================================
+//  入力
+// =====================================================================
+const keys={left:false,right:false};
+let jumpBufferT=0, coyoteT=0, joyId=null, joyBase=null, joyVec=0, jumpId=null;
+let hasMotion=false, uprightSign=-1;
+
+function toLogical(cx,cy){ const r=canvas.getBoundingClientRect(); let x=cx-r.left,y=cy-r.top;
+  if (flipped){ x=W-x; y=H-y; } return {x,y}; }
+function ui(){ const top=Math.max(50,H*0.09);
+  return { jump:{x:W-96,y:H-110,r:90}, flip:{x:W/2,y:top,w:210,h:58} }; }
+function inCircle(px,py,c){ const dx=px-c.x,dy=py-c.y; return dx*dx+dy*dy<=c.r*c.r; }
+function inRect(px,py,r){ return px>=r.x-r.w/2&&px<=r.x+r.w/2&&py>=r.y-r.h/2&&py<=r.y+r.h/2; }
+
+function onDown(e){ const list=e.changedTouches?e.changedTouches:[e];
+  for (const t of list){ const id=t.identifier!==undefined?t.identifier:"mouse"; const p=toLogical(t.clientX,t.clientY); const u=ui();
+    if (inRect(p.x,p.y,u.flip)){ toggleFlipManual(); continue; }
+    if (jumpId===null && p.x>W/2){ jumpId=id; requestJump(); continue; }
+    if (joyId===null && p.x<=W/2){ joyId=id; joyBase={x:p.x,y:p.y}; updateJoy(p); }
+  } }
+function onMove(e){ const list=e.changedTouches?e.changedTouches:[e];
+  for (const t of list){ const id=t.identifier!==undefined?t.identifier:"mouse"; if (id===joyId) updateJoy(toLogical(t.clientX,t.clientY)); } }
+function onUp(e){ const list=e.changedTouches?e.changedTouches:[e];
+  for (const t of list){ const id=t.identifier!==undefined?t.identifier:"mouse";
+    if (id===joyId){ joyId=null; joyBase=null; joyVec=0; } if (id===jumpId) jumpId=null; } }
+function updateJoy(p){ const m=70; let dx=p.x-joyBase.x; dx=Math.max(-m,Math.min(m,dx)); joyVec=Math.abs(dx)<8?0:dx/m; }
+
+canvas.addEventListener("touchstart",e=>{e.preventDefault();onDown(e);},{passive:false});
+canvas.addEventListener("touchmove", e=>{e.preventDefault();onMove(e);},{passive:false});
+canvas.addEventListener("touchend",  e=>{e.preventDefault();onUp(e);}, {passive:false});
+canvas.addEventListener("touchcancel",e=>{e.preventDefault();onUp(e);},{passive:false});
+canvas.addEventListener("mousedown",e=>onDown(e));
+window.addEventListener("mousemove",e=>{ if(joyId!==null) onMove(e); });
+window.addEventListener("mouseup",e=>onUp(e));
+window.addEventListener("keydown",e=>{ if(e.repeat)return; switch(e.code){
+  case "ArrowLeft": case "KeyA": keys.left=true; break;
+  case "ArrowRight": case "KeyD": keys.right=true; break;
+  case "Space": case "ArrowUp": case "KeyW": requestJump(); break;
+  case "KeyF": toggleFlipManual(); break;
+  case "KeyR": respawn(); break; } });
+window.addEventListener("keyup",e=>{ if(e.code==="ArrowLeft"||e.code==="KeyA")keys.left=false;
+  if(e.code==="ArrowRight"||e.code==="KeyD")keys.right=false; });
+
+// =====================================================================
+//  反転
+// =====================================================================
+function requestFlip(target){
+  if (flipT<FLIP_DUR) return; if (target===flipped) return;
+  flipTarget=target; flipT=0; flipApplied=false; ring(P.x+P.w/2,P.y+P.h/2);
+}
+function toggleFlipManual(){ requestFlip(!flipped); }
+function applyFlip(){
+  flipped=flipTarget; gravityDir = flipped?-1:1;
+  P.y = WORLD_H - P.y - PH;            // 足の裏を軸に境界線の反対側へ
+  P.vy = 0;
+  // 谷の底などから反転して反対側の宙に取り残される場合は、線の表面へ引き上げる
+  const feet = flipped ? P.y : P.y+P.h;
+  const surf = flipped ? BAND_BOT : BAND_TOP;
+  if (Math.abs(feet-surf) > WALL_H*0.5) P.y = flipped ? BAND_BOT : (BAND_TOP-PH);
+  let g=0; while (hitsSolid(P) && g++<400) P.y += -gravityDir*2;
+  P.support=null; P.grounded=false;
+}
+function requestJump(){ jumpBufferT=JUMP_BUFFER; }
+function respawn(){ P.x=SPAWN.x; P.y=SPAWN.y; P.vx=0; P.vy=0; P.grounded=false; P.support=null;
+  flipped=false; gravityDir=1; flipT=FLIP_DUR; flipApplied=true; }
+
+// =====================================================================
+//  センサー
+// =====================================================================
+function enableMotion(){ const add=()=>window.addEventListener("devicemotion",onMotion,true);
+  const D=window.DeviceMotionEvent;
+  if (D&&typeof D.requestPermission==="function") D.requestPermission().then(s=>{if(s==="granted")add();}).catch(()=>{});
+  else add();
+  const O=window.DeviceOrientationEvent; if (O&&typeof O.requestPermission==="function") O.requestPermission().catch(()=>{}); }
+function onMotion(e){ const g=e.accelerationIncludingGravity; if(!g||g.y==null)return;
+  if(!hasMotion){ hasMotion=true; uprightSign=Math.abs(g.y)>4?Math.sign(g.y):-1; }
+  if (Math.abs(g.y)>5){ const physDown=Math.sign(g.y)!==uprightSign; if (physDown!==flipped) requestFlip(physDown); } }
+
+// =====================================================================
+//  更新
+// =====================================================================
+function update(dt){
+  if (shakeT>0) shakeT-=dt;
+  if (flipT<FLIP_DUR){ flipT+=dt;
+    if (!flipApplied && flipT>=FLIP_DUR/2){ applyFlip(); flipApplied=true; shakeT=0.16; shakeMag=10; }
+    updateParts(dt); return; }
+  if (camX===null){ camX=P.x+P.w/2; camY=P.y+P.h; }
+
+  let dir=0; if(keys.left)dir-=1; if(keys.right)dir+=1; dir+=joyVec; dir=Math.max(-1,Math.min(1,dir));
+  if (flipped) dir=-dir;                       // 反転中は左右操作を反転
+  if (dir!==0) P.face=dir>0?1:-1; P.vx=dir*MOVE_SPEED;
+
+  P.vy += GRAVITY*gravityDir*dt; P.vy=Math.max(-1600,Math.min(1600,P.vy));
+  jumpBufferT-=dt; coyoteT-=dt;
+  if (jumpBufferT>0 && (P.grounded||coyoteT>0)){ P.vy=-JUMP_V*gravityDir; P.grounded=false; jumpBufferT=0; coyoteT=0; }
+
+  const wasG=P.grounded; P.grounded=false; P.support=null;
+  const SN=buildSolids();
+  P.x+=P.vx*dt;
+  for (const s of SN){ if(!hits(P,s))continue; if(P.vx>0)P.x=s.x-P.w; else if(P.vx<0)P.x=s.x+s.w; P.vx=0; }
+  if (P.x<0)P.x=0; if (P.x+P.w>WORLD_W)P.x=WORLD_W-P.w;
+
+  P.y+=P.vy*dt;
+  for (const s of SN){ if(!hits(P,s))continue;
+    if (P.vy>0){ P.y=s.y-P.h; if(gravityDir>0){P.grounded=true;P.support=s;} P.vy=0; }
+    else if (P.vy<0){ P.y=s.y+s.h; if(gravityDir<0){P.grounded=true;P.support=s;} P.vy=0; } }
+  if (P.grounded||wasG) coyoteT=COYOTE;
+
+  if (P.y>WORLD_H+200 || P.y<-200){ die(); return; }
+
+  for (const e of enemies){ if(!e.alive)continue; e.bob+=dt*6; e.x+=e.vx*dt;
+    if (e.x<e.min){e.x=e.min;e.vx=Math.abs(e.vx);} if (e.x+e.w>e.max){e.x=e.max-e.w;e.vx=-Math.abs(e.vx);}
+    if (hits(P,e)){ const stomp = gravityDir>0 && P.vy>=0 && (P.y+P.h)-e.y < 24;
+      if (stomp){ e.alive=false; P.vy=-JUMP_V*0.62; burst(e.x+e.w/2,e.y+e.h/2,12); shakeT=0.12; shakeMag=7; }
+      else { die(); return; } } }
+
+  for (const hz of hazards){ const box={x:hz.x+6,y:hz.y,w:hz.w-12,h:hz.h}; if (hits(P,box)){ die(); return; } }
+
+  for (const o of orbs){ if(o.got)continue; const cx=P.x+P.w/2,cy=P.y+P.h/2,dx=cx-o.x,dy=cy-o.y;
+    if (dx*dx+dy*dy < (o.r+P.w/2)*(o.r+P.w/2)){ o.got=true; orbsGot++; burst(o.x,o.y,8); } }
+
+  for (const cp of checkpoints){ if(!cp.used && !flipped && P.grounded && P.x>cp.x){ cp.used=true; SPAWN={x:cp.x,y:BAND_TOP-PH}; } }
+
+  if (!won && P.x+P.w/2>GOAL_X){ won=true; showClear(); }
+
+  const contact = gravityDir>0 ? (P.y+P.h) : P.y;
+  let tx=P.x+P.w/2; const halfVW=(W/scl())/2; tx=Math.max(halfVW,Math.min(WORLD_W-halfVW,tx));
+  camX += (tx-camX)*Math.min(1,14*dt);
+  camY += (contact-camY)*Math.min(1,9*dt);
+  updateParts(dt);
+}
+function die(){ burst(P.x+P.w/2,P.y+P.h/2,16); shakeT=0.3; shakeMag=14; respawn(); }
+function updateParts(dt){ for(let i=parts.length-1;i>=0;i--){ const p=parts[i]; p.life-=dt;
+  if(p.type==="sq"){ p.x+=p.vx*dt; p.y+=p.vy*dt; p.vy+=900*dt; } if(p.life<=0)parts.splice(i,1); } }
+
+// =====================================================================
+//  描画
+// =====================================================================
+function easeIO(t){ return t<0.5?2*t*t:1-Math.pow(-2*t+2,2)/2; }
+function squashY(){ if(flipT>=FLIP_DUR)return 1; const p=flipT/FLIP_DUR;
+  return p<0.5?1-easeIO(p/0.5):easeIO((p-0.5)/0.5); }
+
+function draw(){
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  if (camX===null){ camX=P.x+P.w/2; camY=P.y+P.h; }
+  let ox=0,oy=0; if(shakeT>0){ const k=shakeT/SHAKE_MAXT; ox=(Math.random()*2-1)*shakeMag*k; oy=(Math.random()*2-1)*shakeMag*k; }
+
+  ctx.fillStyle="#fff"; ctx.fillRect(0,0,W,H);
+
+  ctx.save(); ctx.translate(ox,oy);
+  const q=squashY(); ctx.translate(W/2,H/2); ctx.scale(1,q); ctx.translate(-W/2,-H/2);
+  drawWorld(); ctx.restore();
+
+  if (q<0.32){ const a=1-q/0.32; ctx.save(); ctx.globalAlpha=a; ctx.fillStyle="#000";
+    ctx.fillRect(0,H/2-3,W,6); ctx.globalAlpha=a*0.4; ctx.fillRect(0,H/2-12,W,24); ctx.restore(); }
+
+  ctx.save(); if (flipped){ ctx.translate(W,H); ctx.rotate(Math.PI); }
+  drawUI(); drawHUD(); ctx.restore();
+}
+function visX(x,w){ const a=sx(x),b=sx(x+w); return !(b<-60||a>W+60); }
+
+function drawWorld(){
+  // 上下の領域を塗る（境界線で分割）
+  const ly=sy(LINE_Y), lyc=Math.max(0,Math.min(H,ly));
+  ctx.fillStyle=aboveColor(); ctx.fillRect(0,0,W,lyc);
+  ctx.fillStyle=belowColor(); ctx.fillRect(0,lyc,W,H-lyc);
+  const SN=buildSolids();
+  // 谷（穴）：空洞を背景色で塗りつぶし、輪郭を引く
+  for(const f of features){ if(isWall(f)||!visX(f.x,f.w))continue;
+    const top = flipped ? (BAND_BOT-WALL_H) : BAND_TOP;
+    const bot = flipped ? BAND_BOT : (BAND_TOP+WALL_H);
+    ctx.fillStyle = flipped ? belowColor() : aboveColor();         // 背景(空気)の色で穴を塗る
+    ctx.fillRect(sx(f.x), sy(top), ws(f.w), ws(bot-top));
+    const openY = flipped ? bot : top, floorY = flipped ? top : bot;  // 開口側=線、閉口側=底
+    ctx.strokeStyle=opp(aboveColor()); ctx.lineWidth=Math.max(2,ws(3)); // 地面と接する輪郭
+    ctx.beginPath();
+    ctx.moveTo(sx(f.x),       sy(openY));
+    ctx.lineTo(sx(f.x),       sy(floorY));
+    ctx.lineTo(sx(f.x+f.w),   sy(floorY));
+    ctx.lineTo(sx(f.x+f.w),   sy(openY));
+    ctx.stroke();
+  }
+  // 境界線：lineセグメントだけ線を引く（谷の所は開口）
+  ctx.strokeStyle="#000"; ctx.lineWidth=Math.max(2,ws(3));
+  for(const s of SN){ if(!s.line||!visX(s.x,s.w))continue;
+    ctx.beginPath(); ctx.moveTo(sx(s.x),ly); ctx.lineTo(sx(s.x+s.w),ly); ctx.stroke(); }
+  // 壁（領域と反対色の柱）
+  for(const s of SN){ if(!s.wall||!visX(s.x,s.w))continue;
+    ctx.fillStyle=inkAt(s.y+s.h/2); ctx.fillRect(sx(s.x),sy(s.y),ws(s.w),ws(s.h)); }
+
+  for (const hz of hazards){ if(!visX(hz.x,hz.w))continue; drawSpikes(hz.x,hz.y,hz.w,hz.h,hz.dir); }
+
+  for (const o of orbs){ if(o.got||!visX(o.x-20,40))continue; const ink=inkAt(o.y),x=sx(o.x),y=sy(o.y),r=ws(o.r), pl=1+0.12*Math.sin(performance.now()/300);
+    ctx.lineWidth=Math.max(2,ws(3)); ctx.strokeStyle=ink; ctx.beginPath(); ctx.arc(x,y,r*pl,0,6.283); ctx.stroke();
+    ctx.beginPath(); ctx.arc(x,y,ws(4),0,6.283); ctx.fillStyle=ink; ctx.fill(); }
+
+  for (const e of enemies){ if(!e.alive||!visX(e.x,e.w))continue; drawEnemy(e); }
+
+  drawGoal();
+
+  // プレイヤー（いる領域と反対色＝デフォ白/反転黒、縁取りは領域色）
+  const pcx=sx(P.x+P.w/2), pcy=sy(P.y+P.h/2), pr=ws(P.w/2);
+  const pink=inkXY(P.x+P.w/2,P.y+P.h/2), pout=opp(pink);
+  ctx.beginPath(); ctx.arc(pcx,pcy,pr,0,6.283); ctx.fillStyle=pink; ctx.fill();
+  ctx.lineWidth=Math.max(2,ws(3)); ctx.strokeStyle=pout; ctx.stroke();
+  ctx.fillStyle=pout; ctx.beginPath(); ctx.arc(pcx+P.face*pr*0.35,pcy-pr*0.1,ws(4),0,6.283); ctx.fill();
+
+  for (const p of parts){ const px=sx(p.x),py=sy(p.y),a=Math.max(0,p.life/p.max), ink=inkAt(p.y);
+    if(p.type==="sq"){ ctx.globalAlpha=a; ctx.fillStyle=ink; const s=ws(7); ctx.fillRect(px-s/2,py-s/2,s,s); }
+    else { const t=1-a,r=ws(p.r0+(p.r1-p.r0)*t); ctx.globalAlpha=a*0.8; ctx.lineWidth=Math.max(2,ws(4)); ctx.strokeStyle=ink;
+      ctx.beginPath(); ctx.arc(px,py,r,0,6.283); ctx.stroke(); } ctx.globalAlpha=1; }
+}
+function drawSpikes(wxp,wyp,wd,ht,dir){ const ink=inkAt(wyp+ht/2), out=opp(ink); const x=sx(wxp),w=ws(wd),teeth=Math.max(3,Math.round(wd/28)),tw=w/teeth;
+  const base=dir==="up"?sy(wyp+ht):sy(wyp), tip=dir==="up"?sy(wyp):sy(wyp+ht);
+  ctx.fillStyle=ink; ctx.strokeStyle=out; ctx.lineWidth=Math.max(1.5,ws(2));
+  for(let i=0;i<teeth;i++){ const x0=x+i*tw; ctx.beginPath(); ctx.moveTo(x0,base); ctx.lineTo(x0+tw/2,tip); ctx.lineTo(x0+tw,base); ctx.closePath(); ctx.fill(); ctx.stroke(); } }
+function drawEnemy(e){ const ink=inkAt(e.y+e.h/2), out=opp(ink), cx=sx(e.x+e.w/2),cy=sy(e.y+e.h/2)+Math.sin(e.bob)*ws(2),r=ws(e.w/2);
+  ctx.beginPath(); const sp=8;
+  for(let i=0;i<sp*2;i++){ const ang=(Math.PI*2*i)/(sp*2)-Math.PI/2, rr=i%2===0?r:r*0.6;
+    const px=cx+Math.cos(ang)*rr,py=cy+Math.sin(ang)*rr; if(i===0)ctx.moveTo(px,py); else ctx.lineTo(px,py); }
+  ctx.closePath(); ctx.fillStyle=ink; ctx.fill(); ctx.lineWidth=Math.max(1.5,ws(2.5)); ctx.strokeStyle=out; ctx.stroke();
+  ctx.fillStyle=out; ctx.beginPath(); ctx.arc(cx-r*0.25,cy,ws(3),0,6.283); ctx.fill();
+  ctx.beginPath(); ctx.arc(cx+r*0.25,cy,ws(3),0,6.283); ctx.fill(); }
+function drawGoal(){ const gx=sx(GOAL_X),cy=sy(AXIS); if(gx<-60||gx>W+60)return;
+  ctx.save(); ctx.lineWidth=Math.max(2,ws(4)); ctx.setLineDash([ws(14),ws(14)]);
+  ctx.strokeStyle=inkAt(220); ctx.beginPath(); ctx.moveTo(gx,sy(120)); ctx.lineTo(gx,sy(LINE_Y)); ctx.stroke();
+  ctx.strokeStyle=inkAt(500); ctx.beginPath(); ctx.moveTo(gx,sy(LINE_Y)); ctx.lineTo(gx,sy(600)); ctx.stroke();
+  ctx.setLineDash([]); ctx.strokeStyle="#000";
+  for(let i=1;i<=3;i++){ ctx.beginPath(); ctx.arc(gx,cy,ws(15*i),0,6.283); ctx.lineWidth=Math.max(1.5,ws(3)); ctx.stroke(); }
+  ctx.fillStyle="#000"; ctx.beginPath(); ctx.arc(gx,cy,ws(6),0,6.283); ctx.fill(); ctx.restore(); }
+
+// UI：縁取りで両領域で視認させる
+function drawUI(){ const u=ui();
+  ctx.save(); ctx.textAlign="center"; ctx.textBaseline="middle";
+  const f=u.flip; roundRect(f.x-f.w/2,f.y-f.h/2,f.w,f.h,f.h/2);
+  ctx.fillStyle="#000"; ctx.fill(); ctx.lineWidth=2.5; ctx.strokeStyle="#fff"; ctx.stroke();
+  ctx.font="800 19px -apple-system,Arial,sans-serif"; ctx.fillStyle="#fff"; ctx.fillText("⟲ 反転  "+(flipped?"ON":"OFF"),f.x,f.y);
+  ctx.font="700 13px -apple-system,Arial,sans-serif"; ctx.lineWidth=3; ctx.strokeStyle="#000"; ctx.fillStyle="#fff";
+  const hy=H-Math.max(40,H*0.08); ctx.globalAlpha=0.9;
+  ctx.strokeText("左：移動     右：ジャンプ",W/2,hy); ctx.fillText("左：移動     右：ジャンプ",W/2,hy); ctx.globalAlpha=1; ctx.restore(); }
+function drawHUD(){ ctx.save(); ctx.textAlign="left"; ctx.textBaseline="middle"; const x=28,y=Math.max(50,H*0.09);
+  ctx.lineWidth=3; ctx.strokeStyle="#000"; ctx.beginPath(); ctx.arc(x+9,y,8,0,6.283); ctx.stroke();
+  ctx.lineWidth=2; ctx.strokeStyle="#fff"; ctx.beginPath(); ctx.arc(x+9,y,8,0,6.283); ctx.stroke();
+  ctx.font="800 18px -apple-system,Arial,sans-serif";
+  ctx.lineWidth=3; ctx.strokeStyle="#000"; ctx.strokeText("  "+orbsGot+" / "+orbsTotal,x+18,y);
+  ctx.fillStyle="#fff"; ctx.fillText("  "+orbsGot+" / "+orbsTotal,x+18,y); ctx.restore(); }
+function roundRect(x,y,w,h,r){ ctx.beginPath(); ctx.moveTo(x+r,y);
+  ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r); ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath(); }
+
+// =====================================================================
+//  ループ & オーバーレイ
+// =====================================================================
+let running=false,last=0;
+function loop(ts){ if(!running)return; let dt=(ts-last)/1000; last=ts; if(dt>0.05)dt=0.05;
+  if(!won) update(dt); draw(); requestAnimationFrame(loop); }
+const startOverlay=document.getElementById("startOverlay"), clearOverlay=document.getElementById("clearOverlay");
+document.getElementById("startBtn").addEventListener("click",start);
+document.getElementById("retryBtn").addEventListener("click",()=>{ clearOverlay.classList.add("hidden");
+  won=false; orbsGot=0; for(const o of orbs)o.got=false; for(const e of enemies)e.alive=true; for(const cp of checkpoints)cp.used=false;
+  SPAWN={x:120,y:BAND_TOP-PH}; camX=null; respawn(); });
+function start(){ startOverlay.classList.add("hidden"); enableMotion();
+  if(!running){ running=true; last=performance.now(); requestAnimationFrame(loop); } }
+function showClear(){ document.getElementById("clearMsg").textContent="ゴール到達。  オーブ "+orbsGot+" / "+orbsTotal;
+  clearOverlay.classList.remove("hidden"); }
+</script>
+</body>
+</html>
