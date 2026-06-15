@@ -177,14 +177,10 @@ let hasMotion=false, uprightSign=-1;
 
 function toLogical(cx,cy){ const r=canvas.getBoundingClientRect(); let x=cx-r.left,y=cy-r.top;
   if (flipped){ x=W-x; y=H-y; } return {x,y}; }
-function ui(){ const top=Math.max(50,H*0.09);
-  return { jump:{x:W-96,y:H-110,r:90}, flip:{x:W/2,y:top,w:210,h:58} }; }
 function inCircle(px,py,c){ const dx=px-c.x,dy=py-c.y; return dx*dx+dy*dy<=c.r*c.r; }
-function inRect(px,py,r){ return px>=r.x-r.w/2&&px<=r.x+r.w/2&&py>=r.y-r.h/2&&py<=r.y+r.h/2; }
 
 function onDown(e){ const list=e.changedTouches?e.changedTouches:[e];
-  for (const t of list){ const id=t.identifier!==undefined?t.identifier:"mouse"; const p=toLogical(t.clientX,t.clientY); const u=ui();
-    if (inRect(p.x,p.y,u.flip)){ toggleFlipManual(); continue; }
+  for (const t of list){ const id=t.identifier!==undefined?t.identifier:"mouse"; const p=toLogical(t.clientX,t.clientY);
     if (jumpId===null && p.x>W/2){ jumpId=id; requestJump(); continue; }
     if (joyId===null && p.x<=W/2){ joyId=id; joyBase={x:p.x,y:p.y}; updateJoy(p); }
   } }
@@ -400,11 +396,7 @@ function drawGoal(){ const gx=sx(GOAL_X),cy=sy(AXIS); if(gx<-60||gx>W+60)return;
   ctx.fillStyle="#000"; ctx.beginPath(); ctx.arc(gx,cy,ws(6),0,6.283); ctx.fill(); ctx.restore(); }
 
 // UI：縁取りで両領域で視認させる
-function drawUI(){ const u=ui();
-  ctx.save(); ctx.textAlign="center"; ctx.textBaseline="middle";
-  const f=u.flip; roundRect(f.x-f.w/2,f.y-f.h/2,f.w,f.h,f.h/2);
-  ctx.fillStyle="#000"; ctx.fill(); ctx.lineWidth=2.5; ctx.strokeStyle="#fff"; ctx.stroke();
-  ctx.font="800 19px -apple-system,Arial,sans-serif"; ctx.fillStyle="#fff"; ctx.fillText("⟲ 反転  "+(flipped?"ON":"OFF"),f.x,f.y);
+function drawUI(){ ctx.save(); ctx.textAlign="center"; ctx.textBaseline="middle";
   ctx.font="700 13px -apple-system,Arial,sans-serif"; ctx.lineWidth=3; ctx.strokeStyle="#000"; ctx.fillStyle="#fff";
   const hy=H-Math.max(40,H*0.08); ctx.globalAlpha=0.9;
   ctx.strokeText("左：移動     右：ジャンプ",W/2,hy); ctx.fillText("左：移動     右：ジャンプ",W/2,hy); ctx.globalAlpha=1; ctx.restore(); }
@@ -414,8 +406,6 @@ function drawHUD(){ ctx.save(); ctx.textAlign="left"; ctx.textBaseline="middle";
   ctx.font="800 18px -apple-system,Arial,sans-serif";
   ctx.lineWidth=3; ctx.strokeStyle="#000"; ctx.strokeText("  "+orbsGot+" / "+orbsTotal,x+18,y);
   ctx.fillStyle="#fff"; ctx.fillText("  "+orbsGot+" / "+orbsTotal,x+18,y); ctx.restore(); }
-function roundRect(x,y,w,h,r){ ctx.beginPath(); ctx.moveTo(x+r,y);
-  ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r); ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath(); }
 
 // =====================================================================
 //  ループ & オーバーレイ
